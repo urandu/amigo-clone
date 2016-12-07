@@ -1,0 +1,36 @@
+<!-- Begin: browse.tmpl -->
+
+[% INCLUDE common/noscript_js_necessary.tmpl %]
+
+[% rollup_id = "info_header" %]
+[% rollup_anchor = "Browse Ontologies" %]
+[% INCLUDE "common/info_rollup_start.tmpl" %]
+<p>
+  Unlike some ontology browsers, which give a direct topological
+  view of the graph relations of terms, this browser shows the
+  logical relations of the term in question to its ancestors and
+  children.
+</p>
+<!-- <p> -->
+<!--   More information can be found in the -->
+<!--   <a href="http://wiki.geneontology.org/index.php/AmiGO_2_Manual">manual</a>. -->
+<!-- </p> -->
+[% INCLUDE "common/info_rollup_end.tmpl" %]
+
+<div class="panel panel-default">
+  <!-- <div class="panel-heading"> -->
+    <!-- <div class="panel-title"> -->
+    <!-- </div> -->
+  <!-- </div> -->
+  <div class="panel-body">
+
+    [% IF in_term %]
+    <h4>Transitive term neighborhood for: [% in_term %]</h4>
+    [% ELSE %]
+    <h4>Transitive term neighborhood from roots</h4>
+    [% END %]
+    <div id="browser_id"></div>
+
+  </div>
+</div>
+<!-- End: browse.tmpl -->

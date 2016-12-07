@@ -1,0 +1,1036 @@
+#!/usr/bin/perl -w
+####
+#### NODE: ???
+#### TODO: ???
+#### BUG: ???
+####
+
+use utf8;
+use strict;
+use File::Spec; # needed because Perl does not internally expand ~ paths.
+use Config::YAML;
+use YAML::Loader;
+#use JSON::PP;
+use JSON::XS;
+use Template;
+use File::Basename;
+use File::Find;
+use File::Temp;
+use Cwd;
+use Data::Dumper;
+use Date::Parse;
+use Clone;
+use vars qw(
+	     $opt_h
+	     $opt_v
+	     $opt_b
+	  );
+use Getopt::Std;
+
+
+## Since internal checks are done, get ready for user input.
+getopts('hvgdbuV:');
+
+## Embedded help through perldoc.
+if( $opt_h ){
+  system('perldoc', __FILE__);
+  exit 0;
+}
+
+## Empty init (helps later scoping fun).
+my @args = ();
+
+## Check our options.
+ll("Will print verbose messages.");
+if( $opt_b ){
+  ll("Only produce amigo2-instance-data module (which can be used for local development).");
+}
+
+## First check that we are in the proper directory. Installation
+## should only occur in the top directory.
+if ( ! -f "./package.json" ||
+     ! -f "./javascript/npm/amigo2-instance-data/package.json" ||
+     ! -f "./scripts/version.pl" ||
+     ! -f "./scripts/simulate.pl" ||
+     ! -f "./conf/.initial_values.yaml" ) {
+  ll("This does not seem to be the base AmiGO directory!");
+  ll("Please run \"install\" from the base AmiGO directory.");
+  exit 0;
+}
+
+###
+### Get oriented.
+###
+
+my $amigo_base = getcwd();
+
+## Start a little YAMLing.
+my $amigo_vars = $amigo_base . "/conf/.initial_values.yaml";
+my $amigo_conf = $amigo_base . "/conf/amigo.yaml";
+my $yconf = Config::YAML->new(config => $amigo_vars, output => $amigo_conf);
+
+ll("Looking for an already made amigo.yaml configuration file...");
+if( -e $amigo_conf && -f $amigo_conf && -R $amigo_conf ) {
+  ll("Found it! Will use values from $amigo_conf...");
+  $yconf->read($amigo_conf);
+
+  ## We'll be writing to this file as well, so let's check now.
+  if( ! -W $amigo_conf  ) {
+    die "$amigo_conf must be writable by this process; change permissions."
+  }
+}else{
+  ll("None found, will make a new one at $amigo_conf.");
+}
+
+## Check and see if AMIGO_ROOT is defined. If not, go ahead and take a
+## guess at it.
+$yconf->{AMIGO_ROOT}{value} = $amigo_base;
+ll("Guessing the location of AmiGO\'s root directory... $amigo_base");
+
+## Always want the writeback, as the values in amigo.yaml will always
+## supersede the ones in the initial file.
+$yconf->write();
+
+###
+### Fold the YAML values into our local environment.
+###
+
+my %env_conf;
+
+## TODO: could do simple validation in here...
+## Roll into env_conf.
+for my $var (keys %$yconf){
+  ## Check that it is a real var, and not Config::YAML overhead.
+  if( $yconf->{$var} && ref($yconf->{$var}) eq 'HASH' ){
+    my $var_type = $yconf->{$var}{type};
+    if( $var_type eq 'boolean' ||
+	$var_type eq 'integer' ||
+	$var_type eq 'number' ){
+      ## Attempt to turn number types back into numbers.
+      $env_conf{$var} = int($yconf->{$var}{value});
+    }elsif( $var_type eq 'list' ){
+      ## Lists need to be processed into something that the env conf
+      ## can take through perl.
+      $env_conf{$var} = join(' ', @{$yconf->{$var}{value}});
+    }elsif( $var_type eq 'json' ){
+      ## Like list, except we're getting serious now--turn into a JSON
+      ## string that can be recovered later.
+      my $js = JSON::XS->new();
+      my $js_str = $js->encode($yconf->{$var}{value});
+      $env_conf{$var} = $js_str;
+    }else{
+      ## Take strings as-is.
+      $env_conf{$var} = $yconf->{$var}{value};
+    }
+  }
+}
+
+###
+### We now have as much information as we're going to get about the
+### wanted environment, so let's make new (synthetic) variables,
+### directories.
+###
+
+## Read in package.json to extract current version information.
+my $package_json = AmiGO::_read_json_file(undef, './package.json');
+my $version = $package_json->{version};
+
+## Our version comes explicitly from the conf now.
+if( $version ){
+  ll("Defined version: " . $version);
+}else{
+  die "Unable to figure out version!";
+}
+
+## Remove trailing slashes from all such variables.
+my @pvars = qw(
+		AMIGO_ROOT
+		AMIGO_STATIC_PATH
+		AMIGO_STATIC_URL
+		AMIGO_DYNAMIC_PATH
+		AMIGO_DYNAMIC_URL
+		AMIGO_WORKING_PATH
+		AMIGO_1X_PUBLIC_CGI_BASE_URL
+	     );
+foreach my $pvar (@pvars){
+  $env_conf{$pvar} =
+    eval {
+      my $foo = '';
+      ( $foo = $env_conf{$pvar} ) =~ s/\/$//;
+      $foo; };
+}
+
+## Image URL and dir.
+$env_conf{AMIGO_IMAGE_DIR} =
+  $env_conf{AMIGO_STATIC_PATH} . '/images';
+$env_conf{AMIGO_IMAGE_URL} =
+  $env_conf{AMIGO_STATIC_URL} . '/images';
+
+## CSS URL and dir.
+$env_conf{AMIGO_CSS_DIR} =
+  $env_conf{AMIGO_STATIC_PATH} . '/css';
+$env_conf{AMIGO_CSS_URL} =
+  $env_conf{AMIGO_STATIC_URL} . '/css';
+
+## Static JS URL and dir.
+$env_conf{AMIGO_JS_DIR} =
+  $env_conf{AMIGO_STATIC_PATH} . '/js';
+$env_conf{AMIGO_JS_URL} =
+  $env_conf{AMIGO_STATIC_URL} . '/js';
+
+## Dynamic/locally developed JS URL and dir.
+$env_conf{AMIGO_JS_DEV_DIR} =
+  $env_conf{AMIGO_ROOT} . '/javascript/staging';
+$env_conf{AMIGO_JS_DEV_URL} =
+  $env_conf{AMIGO_STATIC_URL} . '/staging';
+
+## A place for caching databases.
+$env_conf{AMIGO_CACHE_DIR} = $env_conf{AMIGO_WORKING_PATH} . '/cache';
+safe_make_dir( $env_conf{AMIGO_CACHE_DIR} );
+make_permissive( $env_conf{AMIGO_CACHE_DIR} );
+
+## A place for log files.
+$env_conf{AMIGO_LOG_DIR} = $env_conf{AMIGO_WORKING_PATH} . '/log';
+safe_make_dir( $env_conf{AMIGO_LOG_DIR} );
+make_permissive( $env_conf{AMIGO_LOG_DIR} );
+
+## Session top-level location.
+$env_conf{AMIGO_SESSIONS_ROOT_DIR} = $env_conf{AMIGO_WORKING_PATH} .'/sessions';
+safe_make_dir( $env_conf{AMIGO_SESSIONS_ROOT_DIR});
+make_permissive( $env_conf{AMIGO_SESSIONS_ROOT_DIR});
+
+## A place for scratch files.
+$env_conf{AMIGO_SCRATCH_DIR} = $env_conf{AMIGO_WORKING_PATH}.'/sessions/scratch';
+safe_make_dir( $env_conf{AMIGO_SCRATCH_DIR} );
+make_permissive( $env_conf{AMIGO_SCRATCH_DIR} );
+
+## Override any lies found in the YAML/env config.
+$env_conf{AMIGO_VERSION} = $version;
+
+## Finally, check to see if we can find the GOlr timestamp file and
+## see if we can get a little early info from it--the latest file
+## mentioned.
+$env_conf{GOLR_TIMESTAMP_LAST} = '???';
+#my $glog = $env_conf{GOLR_TIMESTAMP_LOCATION};
+my $glog = $env_conf{AMIGO_WORKING_PATH} . '/golr_timestamp.log';
+if( $glog && -f $glog ){
+
+  ## We don't wildly care if we can get this optional information or
+  ## not, so wrap it away.
+  eval {
+
+    ## Unfortunately, since we can't use full AmiGO directly yet,
+    ## we'll steal a bit of non-environment functionality all nasty
+    ## like.
+    # use AmiGO;
+    # my $core = AmiGO->new();
+    my $ts_details = AmiGO::golr_timestamp_log(undef, $glog);
+    if( $ts_details ){
+
+      ## Get the best latest.
+      my $latest = '';
+      foreach my $tsi (@$ts_details){
+	my $ts = $tsi->{time};
+
+	if( ($ts cmp $latest) == 1 ){
+	  $latest = $ts;
+	}
+      }
+
+      ## If a latest was found, make that the new timestamp for the
+      ## configurations files.
+      if( $latest ){
+	$env_conf{GOLR_TIMESTAMP_LAST} = $latest;
+      }
+    }
+  };
+}
+
+ll("Finish setting up the installation environment.");
+
+###
+### Dump the synthetic environment into config.pl and move it over to
+### the cgi-bin.
+###
+
+my $synth_conf_fname = $env_conf{AMIGO_DYNAMIC_PATH} . '/config.pl';
+ll("Starting installation...");
+create_synthetic_amigo_environmental_variables($synth_conf_fname, \%env_conf);
+ll("Created synthetic variables and configuration file: $synth_conf_fname");
+
+###
+### Dump the YAML GOlr config into a representation that we can use
+### (amigo.data.golr).
+###
+
+## Slurp all *config.yaml files at this location.
+my $yaml_list = $env_conf{GOLR_METADATA_LIST};
+my @yaml_confs = split(/\s+/, $yaml_list);
+ll("YAML config files found: " . join(', ', @yaml_confs));
+my $golr_data_fname = 'javascript/npm/amigo2-instance-data/lib/data/golr.js';
+golr_config_to_meta_js($golr_data_fname, \@yaml_confs);
+ll("Created GOlr JavaScript data file: \"$golr_data_fname\".");
+
+###
+### Dump the synthetic environment (a la config.pl), plus some extras,
+### into a representation that we can use (amigo.data.server).
+###
+
+## Re-establish the environment.
+## WARNING: See the synth conf generation above.
+require $synth_conf_fname;
+my $amigo_env_fname = 'javascript/npm/amigo2-instance-data/lib/data/server.js';
+amigo_env_to_js($amigo_env_fname);
+ll("Created AmiGO JavaScript meta file: \"$amigo_env_fname\".");
+
+###
+### Pull in the db-xrefs.yaml file and turn it into a form that the js
+### linker can use (amigo.data.xrefs), as well as the perl linker
+### (through AmiGO.pm).
+###
+
+## Roll JS out to the server environment in a b-flag situation.
+my $xrefs_js_data_fname = 'javascript/npm/amigo2-instance-data/lib/data/xrefs.js';
+my $xrefs_url = 'https://raw.githubusercontent.com/geneontology/go-site/master/metadata/db-xrefs.yaml';
+xref_abbs_to_meta_js($xrefs_js_data_fname, $xrefs_url, 'js');
+ll("Created GO XRefs JavaScript data file: \"$xrefs_js_data_fname\".");
+
+###
+### Generate the definitions file from the amigo.yaml configurations.
+###
+
+my $amigo_defs_fname = 'javascript/npm/amigo2-instance-data/lib/data/definitions.js';
+amigo_defs_to_js($amigo_defs_fname);
+ll("Created AmiGO JavaScript definition file: \"$amigo_defs_fname\".");
+
+###
+### Copy over the rest of the templates into the live JS directory.
+###
+
+## We know that these remaining templates are just blanks (no data
+## input from the outside work right now), so just copy them over.
+my $remaining_js_templates = ['context.js', 'dispatch.js'];
+my $tmpl_src = 'javascript/npm/amigo2-instance-data/generation-templates/';
+my $tmpl_dst = 'javascript/npm/amigo2-instance-data/lib/data/';
+foreach my $template (@$remaining_js_templates){
+
+  ## Full names.
+  my $src_fname = $tmpl_src . $template . '.tmpl',;
+  my $dst_fname = $tmpl_dst . $template;
+
+  ###
+  ### Instead of doing the obvious force_copy() call, we'll setup as if
+  ### we were going to apply variables to the template--this will make
+  ### things easier later on as we add more and complicated templates.
+  ###
+
+  ## force_copy($src_fname, $dst_fname);
+
+  ## If the JS file is already there, blow it away, and pile it in.
+  unlink $dst_fname if -f $dst_fname;
+  open(FILE, ">$dst_fname") or die "cannot open $dst_fname: $!";
+
+  ## Template to string output.
+  my $output = '';
+  my $tt = Template->new();
+  $tt->process($src_fname,
+	       {
+		## Nothing here yet.
+	       },
+	       \$output)
+    || die $tt->error;
+  print FILE $output;
+
+  ## Close file.
+  close(FILE);
+  make_readable($dst_fname);
+
+  ll("Created JavaScript data file: \"$dst_fname\".");
+}
+
+# ###
+# ### Create the JS bundle that we'll use in our staging area.
+# ###
+
+# ## 
+# my $release_args_compressed =
+#   [
+#    './scripts/release-js.pl', '-v',
+#    '-i', 'scripts/release-js-file-map.txt',
+#    '-o', 'javascript/staging/amigo2.js',
+#    '-n', 'amigo',
+#    '-d', 'javascript/lib/amigo',
+#    '-r', $version
+#   ];
+# ## In the case that we don't want compression, add the -u flag.
+# if( $opt_u ){
+#   $release_args_compressed =
+#     [
+#      './scripts/release-js.pl', '-v',
+#      '-u',
+#      '-i', 'scripts/release-js-file-map.txt',
+#      '-o', 'javascript/staging/amigo2.js',
+#      '-n', 'amigo',
+#      '-d', 'javascript/lib/amigo',
+#      '-r', $version
+#     ];
+# }
+# my $rcmd = join(' ', @$release_args_compressed);
+# ll('System: ' . $rcmd . '"');
+# system(@$release_args_compressed) == 0 || die "system $rcmd failed: $?";
+
+###
+### Copy/create runtime files to the CGI directory.
+###
+
+if( ! $opt_b ){
+
+  ## Roll perl out to the server environment in a non-b-flag situation.
+  my $xrefs_json_data_fname = $env_conf{AMIGO_DYNAMIC_PATH} . '/xrefs.json';
+  my $xrefs_url = 'https://raw.githubusercontent.com/geneontology/go-site/master/metadata/db-xrefs.yaml';
+  xref_abbs_to_meta_js($xrefs_json_data_fname, $xrefs_url, 'json');
+  ll("Created GO XRefs JSON data file: \"$xrefs_json_data_fname\".");
+
+}
+
+# ###
+# ### Copy development files over to staging.
+# ###
+
+# force_copy('javascript/web/' , $env_conf{AMIGO_JS_DEV_DIR});
+# force_copy('external/bbop.js' , $env_conf{AMIGO_JS_DEV_DIR});
+
+## Committed symlink--looks okay in git.
+# ###
+# ### Create a symlink between javascript staging (where our bundle is)
+# ### and static staging (where we'll serve it from).
+# ### Note sure how to do this when dealing with OpenShift...
+# ###
+
+# make_link('../javascript/staging', 'static/staging');
+
+###
+### Finish.
+###
+
+## Done.
+if( ! $opt_b ){
+  print <<EOC;
+Done.
+
+Your new installation is at: $env_conf{AMIGO_DYNAMIC_URL}/amigo
+
+You may need to use the cleaning script (scripts/clean-filesystem.pl)
+to regularly purge unneeded and old files generated while AmiGO is
+running. Please see the script documentation for details and warnings.
+
+The other useful end-user scripts are: global-message.pl,
+clean-filesystem.pl, and blank-kvetch.pl. Please see the script
+documentation for details.
+
+Your JavaScript bundle should be available in:
+$env_conf{AMIGO_JS_DEV_DIR}
+
+EOC
+}else{
+  print <<EOC;
+Done.
+
+Your JavaScript bundles should be available in: $env_conf{AMIGO_JS_DEV_DIR}
+EOC
+}
+
+###
+### Helper functions.
+###
+
+##
+sub create_synthetic_amigo_environmental_variables {
+
+  my $pconf_name = shift || die 'need file argument';
+  my $env_conf_ptr = shift || die 'need env conf argument';
+  my $env_conf = %$env_conf_ptr;
+
+  ## Open file.
+  open(FILE, ">$pconf_name");
+
+  print FILE <<EOC;
+############################
+####
+#### See INSTALL.org on how to change these variables.
+####
+############################
+
+EOC
+
+  ##
+  foreach ( keys %env_conf ) {
+
+    #print STDERR '$ENV{' . $_ . '}=' . $env_conf{$_} . "\n";
+
+    my $syn = "\$ENV{" . $_. "}=";
+    #if( $_ eq 'PATH' ){
+    #  $syn .= $env_conf{$_};
+    #}else{
+    $syn .= "\'" . $env_conf{$_} . "\'";
+    #}
+    print FILE $syn . ";\n";
+    #ll("Created: " . $syn);
+  }
+
+  ## End.
+  print FILE <<EOC;
+
+1;
+EOC
+
+  ## Close file.
+  close(FILE);
+  make_readable( $pconf_name );
+}
+
+
+## file: <local_js_tree>/lib/amigo/data/xrefs.js
+## file: <amigo_cgi_bin>/xrefs.json
+## Taken from: ../../go-dev/trunk/amigo/scripts/make_dblinks.pl
+sub xref_abbs_to_meta_js {
+
+  my $file_str = shift || die "need a file string or something";
+  my $xrefs_url = shift || die "need a url for the db-xrefs.yaml file";
+  my $type = shift || die "need 'js' or 'json'";
+
+  ## 
+  use lib getcwd() . '/perl/lib';
+
+  ## Bring in necessaries.
+  use AmiGO::External::Raw;
+  use AmiGO::JavaScript;
+
+  my $core = AmiGO::JavaScript->new();
+
+  ## Use external to get file, if it cannot be found, fall back to the
+  ## local emergency copy.
+  my $ext = AmiGO::External::Raw->new();
+  my $abbs = $ext->get_external_data($xrefs_url);
+  if( ! $abbs ){
+    ll("Could not load external db-xrefs.yaml file, trying old backup...");
+    my $abbs_fname = $ENV{AMIGO_ROOT} . '/external/db-xrefs.yaml';
+    ll("Backup at: " . $abbs_fname . '?');
+    die "No emergency abbs file found ($abbs_fname): $!" if ! -f $abbs_fname;
+    open(ABBSFILE, '<', $abbs_fname) or die "Cannot even open $abbs_fname: $!";
+    while( <ABBSFILE> ){
+      $abbs .= $_;
+    }
+    close ABBSFILE;
+  }
+  die "Found no way to get a db-xrefs.yaml file: $!" if ! $abbs;
+
+  ## Parse the YAML file into something usable.
+  my $fh = File::Temp->new();
+  my $fname = $fh->filename();
+  #ll("NAME: " . $fname);
+  #ll("NAME: " . $abbs);
+  #print $fh $abbs. "\n";
+  print $fh $abbs;
+  #my $conf_list = [];
+
+  #my $conf_list = Config::YAML->new(config => $fname);
+  use YAML::Loader;
+  my $yloader = YAML::Loader->new;
+  my $conf_list = $yloader->load($abbs);
+  ## Convert the new nice stuff into the old crufty blob layout.
+  my $database_info = {};
+  foreach my $data_set (@$conf_list){
+
+    ## We'll do this for every one of the synonyms, if there are any.
+    my $synonyms = $data_set->{synonyms} || [];
+    unshift(@$synonyms, $data_set->{database});
+    foreach my $synonym (@$synonyms){
+
+      ## Now, go through all the enitity types and create a new lookup
+      ## chunk for it.
+      foreach my $entity_type (@{$data_set->{entity_types}}){
+
+	## Pick a representitive URL.
+	my $gurls = $data_set->{generic_urls};
+	my $gurl = undef;
+	if( scalar(@$gurls) ){
+	  $gurl = $gurls->[0];
+	}
+
+	## Create an empty template for the kinds of things we might
+	## find and try add fill them in.
+	my $tmp_data =
+	  {
+	   id => $data_set->{database}, # repeat
+	   abbreviation => $synonym,
+	   name => $data_set->{name}, # repeat
+	   fullname => $data_set->{description},
+	   datatype => $entity_type->{type_name},
+	   database => $data_set->{name},
+	   object => $entity_type->{type_name},
+	   example_id => $entity_type->{example_id},
+	   generic_url => $gurl,
+	   url_syntax => $entity_type->{url_syntax},
+	   url_example => $entity_type->{example_url},
+	   uri_prefix => undef # what is this?
+	  };
+
+	## Drop into the lookup.
+	$database_info->{lc($synonym)} = $tmp_data;
+      }
+    }
+  }
+
+  if( $type eq 'js' ){
+
+    ###
+    ### Conf to JS.
+    ###
+
+    my $js = JSON::XS->new()->pretty(1);
+    #$js->allow_bignum(1); # if needed, go back to ::PP
+    my $js_str = $js->encode($database_info);
+    chomp $js_str;
+
+    ## If the JS file is already there, blow it away, and pile it in.
+    unlink $file_str if -f $file_str;
+    open(FILE, ">$file_str") or die "cannot open $file_str: $!";
+
+    ## Template to string output.
+    my $output = '';
+    my $tt = Template->new();
+    $tt->process('javascript/npm/amigo2-instance-data/generation-templates/xrefs.js.tmpl',
+		 {
+		  xrefs_data => $js_str,
+		  xrefs_url => $xrefs_url,
+		 },
+		 \$output)
+      || die $tt->error;
+    print FILE $output;
+
+    ## Close file.
+    close(FILE);
+    make_readable($file_str);
+
+  }elsif( $type eq 'json' ){
+
+    ## If the json file is already there, blow it away, and pile it in.
+    unlink $file_str if -f $file_str;
+    open(JSONF, ">$file_str") or die "cannot open $file_str: $!";
+    my $json = JSON::XS->new()->pretty(0);
+    #$js->allow_bignum(1); # if needed, go back to ::PP
+    my $json_str = $json->encode($database_info);
+    chomp $json_str;
+    print JSONF $json_str;
+    close(JSONF);
+    make_readable($file_str);
+  }
+}
+
+
+## file: <local_js_tree>/lib/amigo/data/golr.js
+sub golr_config_to_meta_js {
+
+  my $js_file_str = shift || die "need a js file string or something";
+  my $yaml_confs = shift || die "need a bunch of yaml confs";
+  my $rethash = {};
+
+  ## 
+  use lib getcwd() . '/perl/lib';
+
+  ## Bring in necessaries.
+  use AmiGO::JavaScript;
+
+  my $core = AmiGO::JavaScript->new();
+
+  ## Force array ref.
+  if( ref $yaml_confs ne 'ARRAY' ){
+    $yaml_confs = [$yaml_confs];
+  }
+
+  ## Get all of the YAML files into a single data structure.
+  foreach my $yaml_conf (@$yaml_confs){
+
+    ## Fix incoming tilde paths. Taken from:
+    ## http://www.perlmonks.org/?node_id=156995
+    if ( $yaml_conf =~ s<^~([^/]*)/></> ){
+      my $homedir = $1 ? (getpwnam($1))[7] # specified user
+	: $ENV{'HOME'} || (getpwuid($<))[7] # ourselves
+	  or die "Where's your home?\n";
+      $yaml_conf = File::Spec->catfile($homedir, $yaml_conf);
+    }
+
+    ## Read the config and pull the id.
+    my $conf_hash = Config::YAML->new(config => $yaml_conf);
+    my $conf_id = $conf_hash->{id};
+    ll("Loaded config: " . $conf_id);
+
+    ## Make sure that the top level hash the required fields.
+    $rethash->{ $conf_id } =
+      $core->merge({
+		    id => $conf_id,
+		    searchable_extension => "_searchable",
+		    weight => 0,
+		    document_category => "",
+		    boost_weights => "",
+		    result_weights => "",
+		    filter_weights => ""
+		   }, $conf_hash);
+
+    ## Also make sure that the default fields are there properly for
+    ## each config.
+    my $new_fields_hash = {};
+    my $new_fields = [];
+    foreach my $field (@{$rethash->{$conf_id}{fields}}){
+      my $new_bit = $core->merge({
+				  required => 'false',
+				  cardinality => 'single',
+				  searchable => 'false',
+				  indexed => 'true',
+				  transform => []
+				 }, $field);
+      $new_fields_hash->{$field->{'id'}} = $new_bit; # id better be defined...
+      push @$new_fields, $new_bit;
+    }
+    $rethash->{$conf_id}{fields_hash} = $new_fields_hash;
+    $rethash->{$conf_id}{fields} = $new_fields;
+  }
+
+  ###
+  ### Conf to JS.
+  ###
+
+  my $js = JSON::XS->new()->pretty(1);
+  #$js->allow_bignum(1); # if needed, go back to ::PP
+  my $js_str = $js->encode($rethash);
+  chomp $js_str;
+
+  ## If the file is already there, blow it away.
+  unlink $js_file_str if -f $js_file_str;
+  open(FILE, ">$js_file_str") or die "cannot open $js_file_str: $!";
+
+  ## Template to string output.
+  my $output = '';
+  my $tt = Template->new();
+  $tt->process('javascript/npm/amigo2-instance-data/generation-templates/golr.js.tmpl',
+	       {golr_data => $js_str}, \$output)
+    || die $tt->error;
+  print FILE $output;
+
+  ## Close file.
+  close(FILE);
+  make_readable($js_file_str);
+}
+
+## file: <local_js_tree>/lib/amigo/data/server.js
+sub amigo_env_to_js {
+
+  my $file_str = shift || die 'need target file';
+
+  ## 
+  use lib getcwd() . '/perl/lib';
+  ## WARNING: See the synth conf generation above.
+  require $synth_conf_fname;
+  #require $env_conf{AMIGO_CGI_ROOT_DIR} . '/config.pl';
+
+  ## Bring in necessaries.
+  use AmiGO::JavaScript;
+  my $core = AmiGO::JavaScript->new();
+
+  ## If the file is already there, blow it away.
+  unlink $file_str if -f $file_str;
+  open(FILE, ">$file_str") or die "cannot open $file_str: $!";
+
+  # $core->kvetch('file_str: ' . $file_str);
+  # $core->kvetch('core: ' . $core);
+
+  ## Get the basics. Should be fast as they are already cached in
+  ## AmiGO.pm.
+  # my $evcodes = $core->evidence_codes();
+  # my $species = $core->species();
+  # my $sources = $core->source();
+  # my $gptypes = $core->gptype();
+  # my $onts = $core->ontology();
+  # my $relname = $core->release_name();
+  # my $reltype = $core->release_type();
+  my $evcodes = {};
+  my $species = {};
+  my $sources = {};
+  my $gptypes = {};
+  my $onts = {};
+  #my $relname = '';
+  #my $reltype = '';
+
+  ## Transform them into something a little more useful for the client
+  ## (i.e. arrayified and ordered instead of the straight hash refs
+  ## that we have.
+  my $fix = sub {
+
+    my $thing = shift;
+
+    ## Arrayify.
+    $thing = [map { [$thing->{$_} , $_ ] } keys %$thing];
+
+    ## Sort on key.
+    $thing = [sort{
+      #print STDERR $$a[0]. ' vs ' . $$b[0] . "\n";
+      return $$a[0] cmp $$b[0];
+    } @$thing];
+
+    return $thing;
+  };
+
+  # print STDOUT "VVVVVVVV\n";
+  # my $terms_raw = $core->amigo_env('AMIGO_ROOT_TERMS');
+  # print STDOUT scalar($terms);
+  # print STDOUT "\n";
+  # print STDOUT "^^^^^^^^\n";
+
+  ## Assemble all meta information.
+  my $ret =
+    {
+     ## Variables.
+     app_base => $core->amigo_env('AMIGO_DYNAMIC_URL'),
+     golr_base => $core->amigo_env('AMIGO_PUBLIC_GOLR_URL'),
+     golr_bulk_base => $core->amigo_env('AMIGO_PUBLIC_GOLR_BULK_URL'),
+     noctua_base => $core->amigo_env('AMIGO_PUBLIC_NOCTUA_URL'),
+     galaxy_base => $core->amigo_env('AMIGO_PUBLIC_GALAXY_URL'),
+     html_base => $core->amigo_env('AMIGO_STATIC_URL'),
+     image_base => $core->amigo_env('AMIGO_IMAGE_URL'),
+     css_base => $core->amigo_env('AMIGO_CSS_URL'),
+     js_base => $core->amigo_env('AMIGO_JS_URL'),
+     js_dev_base => $core->amigo_env('AMIGO_JS_DEV_URL'),
+     term_regexp => $core->amigo_env('AMIGO_TERM_REGEXP'),
+     beta => $core->amigo_env('AMIGO_BETA'),
+     browse_filter_idspace => $core->amigo_env('AMIGO_BROWSE_FILTER_IDSPACE'),
+
+     ## Data.
+     evidence_codes => $evcodes,
+     species_map => $species,
+     species => &$fix($species),
+     sources => &$fix($sources),
+     gp_types => &$fix($gptypes),
+     ontologies => &$fix($onts),
+     #release_name => $relname,
+     #release_type => $reltype,
+     root_terms => $core->get_root_terms(),
+
+     ## Resources (note naming convention).
+     bbop_img_star => $core->get_image_resource('star'),
+    };
+
+  ##
+  #my $js = JSON::PP->new();
+  my $js = JSON::XS->new();
+  #$js->allow_bignum(1); # if needed, go back to ::PP
+  my $json_str = $js->encode($ret);
+
+  # ##
+  # sub var_gen {
+  #   my $key = shift || '';
+  #   return "    var $key = meta_data.$key;";
+  # }
+  # sub getter_gen {
+  #   my $key = shift || '';
+  #   return "    this.$key = function(){ return $key; };";
+  # }
+  # my $acc_strings = ();
+  # foreach my $key (keys %$ret){
+  #   push @$acc_strings, '    /*';
+  #   push @$acc_strings, '     * Function: ' . $key;
+  #   push @$acc_strings, '     * ';
+  #   push @$acc_strings, '     * Access to AmiGO variable ' . $key . '.';
+  #   push @$acc_strings, '     * ';
+  #   push @$acc_strings, '     * Parameters:';
+  #   push @$acc_strings, '     *  n/a';
+  #   push @$acc_strings, '     * ';
+  #   push @$acc_strings, '     * Returns:';
+  #   push @$acc_strings, '     *  string';
+  #   push @$acc_strings, '     */';
+  #   push @$acc_strings, var_gen($key);
+  #   push @$acc_strings, getter_gen($key);
+  #   push @$acc_strings, '';
+  # }
+  # my $acc_string = join("\n", @$acc_strings);
+
+  ## Template to string output.
+  my $output = '';
+  my $tt = Template->new();
+  $tt->process('javascript/npm/amigo2-instance-data/generation-templates/server.js.tmpl',
+	       {
+		meta_data => $json_str,
+		# acc_strings_str => $acc_string,
+	       }, \$output)
+    || die $tt->error;
+  print FILE $output;
+
+  ## Close file.
+  close(FILE);
+  make_readable($file_str);
+}
+
+## file: <local_js_tree>/lib/amigo/data/statistics.js
+sub amigo_defs_to_js {
+
+  my $file_str = shift || die 'need target file';
+
+  ## Bring in necessaries.
+  use AmiGO::JavaScript;
+  my $core = AmiGO::JavaScript->new();
+
+  ## If the file is already there, blow it away.
+  unlink $file_str if -f $file_str;
+  open(FILE, ">$file_str") or die "cannot open $file_str: $!";
+
+  # $core->kvetch('file_str: ' . $file_str);
+  # $core->kvetch('core: ' . $core);
+
+  ## Template to string output.
+  my $output = '';
+  my $tt = Template->new();
+  $tt->process('javascript/npm/amigo2-instance-data/generation-templates/definitions.js.tmpl',
+	       {
+		download_limit => $core->amigo_env('AMIGO_DOWNLOAD_LIMIT'),
+	       },
+	       \$output)
+    || die $tt->error;
+  print FILE $output;
+
+  ## Close file.
+  close(FILE);
+  make_readable($file_str);
+}
+
+
+##
+sub safe_make_dir {
+
+  my $dir_to_make = shift || die "no first arg";
+
+  ## Make the new session directory if necessary.
+  if ( ! -e  $dir_to_make ) {
+    my @args = ("mkdir", $dir_to_make);
+    ll("System: \"@args\"") if ! $opt_b;
+    system(@args) == 0 || die "system @args failed: $?" if ! $opt_b;
+  }
+}
+
+
+##
+sub force_copy {
+
+  my $from = shift || die "no first arg";
+  my $to = shift || die "no second arg";
+
+  #my @args = ("cp", "-r", "-f", $from, $to);
+  my @args = ("rsync", "-r",
+	      "--exclude=*~",
+	      "--exclude=.*~",
+	      "--exclude=.git",
+	      "--exclude=.svn",
+	      "--exclude=.emacs.desktop",
+	      $from, $to);
+  ll("System: \"@args\"") if ! $opt_b;
+  system(@args) == 0 || die "System \"@args\" failed: $?" if ! $opt_b;
+}
+
+
+##
+sub make_executable {
+
+  my $file = shift || die "no first arg";
+
+  my @args = ("chmod", "a+x", $file);
+  ll("System: \"@args\"") if ! $opt_b;
+  system(@args) == 0 || die "System \"@args\" failed: $?" if ! $opt_b;
+}
+
+
+##
+sub make_permissive {
+
+  my $file = shift || die "no first arg";
+
+  my @args = ("chmod", "777", $file);
+  ll("System: \"@args\"") if ! $opt_b;
+  system(@args) == 0 || die "System \"@args\" failed: $?" if ! $opt_b;
+}
+
+
+##
+sub make_readable {
+
+  my $file = shift || die "no first arg";
+
+  my @args = ("chmod", "644", $file);
+  ll("System: \"@args\"") if ! $opt_b;
+  system(@args) == 0 || die "System \"@args\" failed: $?" if ! $opt_b;
+}
+
+
+## Make all of the old .cgi filenames accessible through no-cgi names,
+## if applicable.
+# ~/local/src/git/amigo$:) ln -f -s ../javascript/staging static/staging
+sub make_link {
+
+  my $file = shift || die "no file arg";
+  my $target = shift || die "no target arg";
+
+  my @args = ("ln", "-f", "-s", $file, $target);
+  ll("New symlink from $target to $file") if ! $opt_b;
+  system(@args) == 0 || die "System \"@args\" failed: $?" if ! $opt_b;
+}
+
+
+## Just a little printin' when feeling verbose.
+sub ll {
+  my $str = shift || '';
+  print $str . "\n" if $opt_v;
+}
+
+
+## Just a little printin' when feeling afraid.
+sub ww {
+  my $str = shift || '';
+  print STDERR $str . "\n";
+}
+
+
+
+=head1 NAME
+
+install
+
+=head1 SYNOPSIS
+
+install [-h] [-v] [-g] [-e] [-t]
+
+=head1 DESCRIPTION
+
+This is the main AmiGO installation script--it moves files to the
+proper location with the proper permissions.
+
+Please see README.org and INSTALL.org for more details.
+
+=head1 OPTIONS
+
+=over
+
+=item -v
+
+Enable more verbose messages. This is useful for checking installation errors.
+
+=item -b
+
+Ignore all other flags, no not install anything, just do what is
+necessary to create a JS bundle for this installation and put it into
+staging.
+
+=back
+
+=head1 SEE ALSO
+
+http://wiki.geneontology.org/index.php/AmiGO_Manual:_Installation
+
+=cut
